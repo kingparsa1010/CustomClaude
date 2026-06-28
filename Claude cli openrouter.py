@@ -26,10 +26,13 @@ Usage:
 In-session commands:
     /help                show command list
     /clear               wipe conversation history
-    /model <id>          switch model
+    /model               open an interactive model picker (free models first,
+                          then paid/all — fetched live from the provider)
+    /model <id>          switch directly to a model ID
     /effort <level>      reasoning effort: none/low/medium/high/xhigh/max
     /apitype <type>      switch API type: auto/openai/anthropic/gemini
-                          (clears history — wire formats aren't compatible)
+                          (always resets endpoint + model to that type's
+                          defaults, and clears history)
     /endpoint <url>      change the base URL
     /key <key>           change the API key
     /project <path>      change working directory
@@ -772,6 +775,163 @@ def read_input() -> str:
     return first
 
 
+# ── Model catalog + interactive picker ────────────────────────────────────────
+# Static fallback shown only if a live fetch from the provider fails (bad key,
+# no network, endpoint doesn't expose a models-listing route, etc). May go stale.
+FALLBACK_MODELS = {
+    "openai": {
+        "free": ["deepseek/deepseek-v4-flash:free"],
+        "paid": [
+            "openai/gpt-5", "anthropic/claude-sonnet-4-6", "google/gemini-2.5-pro",
+            "deepseek/deepseek-v4-pro", "meta-llama/llama-4-scout", "qwen/qwen3-max",
+        ],
+    },
+    "anthropic": {
+        "all": ["claude-opus-4-7", "claude-sonnet-4-6", "claude-haiku-4-5-20251001"],
+    },
+    "gemini": {
+        "free": ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.5-flash-lite", "gemini-2.0-flash"],
+        "paid": [],
+    },
+}
+
+
+def _fetch_openai_catalog() -> dict:
+    """OpenRouter (and most OpenAI-compatible gateways) expose pricing per
+    model, so free vs. paid is a real signal here — not a guess."""
+    import requests
+    base = cfg["base_url"].rstrip("/")
+    r = requests.get(f"{base}/models", headers={"Authorization": f"Bearer {cfg['api_key']}"}, timeout=8)
+    r.raise_for_status()
+    items = r.json().get("data", [])
+    free, paid = [], []
+    for item in items:
+        mid = item.get("id", "")
+        if not mid:
+            continue
+        is_free = mid.endswith(":free")
+        if not is_free:
+            pricing = item.get("pricing") or {}
+            try:
+                is_free = float(pricing.get("prompt", 1) or 0) == 0 and float(pricing.get("completion", 1) or 0) == 0
+            except (TypeError, ValueError):
+                pass
+        (free if is_free else paid).append(mid)
+    if not free and not paid:
+        raise ValueError("empty catalog")
+    return {"free": sorted(free), "paid": sorted(paid)}
+
+
+def _fetch_anthropic_catalog() -> dict:
+    """Anthropic has no free tier, so this is just a flat list of what your
+    key currently has access to."""
+    import requests
+    base = cfg["base_url"].rstrip("/")
+    r = requests.get(
+        f"{base}/v1/models",
+        headers={"x-api-key": cfg["api_key"], "anthropic-version": "2023-06-01"},
+        timeout=8,
+    )
+    r.raise_for_status()
+    ids = [item.get("id") for item in r.json().get("data", []) if item.get("id")]
+    if not ids:
+        raise ValueError("empty catalog")
+    return {"all": ids}
+
+
+def _fetch_gemini_catalog() -> dict:
+    """The Gemini ListModels response doesn't carry a pricing flag, but
+    every model returned to an AI Studio key is usable under its free
+    per-minute/per-day quota, so we list them all as 'Free'."""
+    import requests
+    base = cfg["base_url"].rstrip("/")
+    r = requests.get(f"{base}/v1beta/models", headers={"x-goog-api-key": cfg["api_key"]}, timeout=8)
+    r.raise_for_status()
+    models = r.json().get("models", [])
+    free = []
+    for m in models:
+        methods = m.get("supportedGenerationMethods", [])
+        if "generateContent" not in methods and "streamGenerateContent" not in methods:
+            continue
+        name = m.get("name", "")
+        short = name.split("/")[-1] if "/" in name else name
+        if short:
+            free.append(short)
+    if not free:
+        raise ValueError("empty catalog")
+    return {"free": sorted(set(free)), "paid": []}
+
+
+_CATALOG_FETCHERS = {
+    "openai": _fetch_openai_catalog,
+    "anthropic": _fetch_anthropic_catalog,
+    "gemini": _fetch_gemini_catalog,
+}
+
+
+def fetch_model_catalog() -> tuple[dict, bool]:
+    """Returns (catalog, used_fallback). catalog is either {'free','paid'}
+    or {'all'} depending on the provider. Never raises."""
+    fetcher = _CATALOG_FETCHERS.get(cfg["api_type"])
+    if fetcher:
+        try:
+            return fetcher(), False
+        except Exception:
+            pass
+    return dict(FALLBACK_MODELS.get(cfg["api_type"], {"all": []})), True
+
+
+def run_model_picker() -> str | None:
+    """Claude-Code-style interactive model selector: free models first (when
+    the provider has any), paid/all models after. Returns the chosen model
+    id, or None if cancelled. Typing a raw model id instead of a number also
+    works, for anything not in the list."""
+    print("\n  Fetching available models…")
+    catalog, used_fallback = fetch_model_catalog()
+
+    print(f"\n{DIVIDER}\n  Select a model  ({cfg['api_type']} · {cfg['base_url']})\n{DIVIDER}")
+    if used_fallback:
+        print("  (couldn't reach the provider's model list — showing a static fallback, may be stale)")
+
+    index_map: dict[int, str] = {}
+    idx = 1
+
+    def _print_section(label: str, model_ids: list[str]) -> None:
+        nonlocal idx
+        if not model_ids:
+            return
+        print(f"  {label}")
+        for mid in model_ids:
+            marker = "  (current)" if mid == cfg["model"] else ""
+            print(f"   {idx:>2}) {mid}{marker}")
+            index_map[idx] = mid
+            idx += 1
+
+    if "all" in catalog:
+        _print_section("Models", catalog.get("all", []))
+    else:
+        _print_section("Free", catalog.get("free", []))
+        _print_section("Paid", catalog.get("paid", []))
+
+    if not index_map:
+        print("  (no models found)")
+
+    print(f"    0) Cancel")
+    print(DIVIDER)
+    print("  Tip: you can also type a model ID directly instead of a number.")
+
+    try:
+        choice = input("  > ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return None
+
+    if not choice or choice == "0":
+        return None
+    if choice.isdigit() and int(choice) in index_map:
+        return index_map[int(choice)]
+    return choice  # let the user type an exact id not in the list
+
+
 # ── Slash-command handler ─────────────────────────────────────────────────────
 def handle_command(raw: str, adapter: BaseAdapter) -> tuple[bool, BaseAdapter]:
     """Returns (was_command, current_adapter) — adapter may be a brand-new
@@ -802,21 +962,32 @@ def handle_command(raw: str, adapter: BaseAdapter) -> tuple[bool, BaseAdapter]:
         return True, adapter
 
     elif cmd == "/apitype":
-        choice = arg.strip().lower()
-        if choice == "auto" or not choice:
-            resolved, reason = detect_api_type(cfg["base_url"], cfg["api_key"])
+        # /apitype <type> [base_url] [model]  — base_url/model are optional
+        # inline overrides; if omitted, the new type's defaults are used.
+        bits = arg.strip().split(None, 2)
+        choice = (bits[0].lower() if bits else "auto") or "auto"
+        custom_base  = bits[1] if len(bits) > 1 else None
+        custom_model = bits[2] if len(bits) > 2 else None
+
+        if choice == "auto":
+            resolved, reason = detect_api_type(custom_base or "", cfg["api_key"])
             print(f"  [auto-detected → {resolved}  ({reason})]")
             choice = resolved
         if choice not in ADAPTERS:
             print(f"  Valid types: auto, {', '.join(ADAPTERS)}")
             return True, adapter
+
         cfg["api_type"] = choice
         defaults = TYPE_DEFAULTS[choice]
-        if not cfg["base_url"]:
-            cfg["base_url"] = defaults["base_url"]
-        if not cfg["model"]:
-            cfg["model"] = defaults["model"]
-        print(f"  [api type → {choice} — history cleared]")
+        # Always reset to this type's own endpoint/model — never carry over
+        # the previous type's base_url/model (that was the bug: switching to
+        # gemini kept using openrouter.ai and the DeepSeek model id).
+        cfg["base_url"] = custom_base or defaults["base_url"]
+        cfg["model"]    = custom_model or defaults["model"]
+        print(f"  [api type → {choice}]")
+        print(f"  [endpoint → {cfg['base_url']}]")
+        print(f"  [model    → {cfg['model']}]")
+        print("  [history cleared]")
         return True, make_adapter(choice)
 
     elif cmd == "/endpoint":
@@ -841,7 +1012,8 @@ def handle_command(raw: str, adapter: BaseAdapter) -> tuple[bool, BaseAdapter]:
   Commands
 {DIVIDER}
   /clear              Wipe conversation history
-  /model <id>         Switch model            (current: {cfg['model']})
+  /model              Open the model picker    (current: {cfg['model']})
+  /model <id>         Switch directly to a model ID
   /effort <level>     Reasoning effort         (current: {cfg['effort']})
   /apitype <type>     auto/openai/anthropic/gemini (current: {cfg['api_type']})
   /endpoint <url>     Change base URL          (current: {cfg['base_url']})
@@ -862,11 +1034,16 @@ def handle_command(raw: str, adapter: BaseAdapter) -> tuple[bool, BaseAdapter]:
         return True, adapter
 
     elif cmd == "/model":
-        if not arg:
-            print(f"  Current model: {cfg['model']}")
-        else:
+        if arg:
             cfg["model"] = arg.strip()
             print(f"  [model → {cfg['model']}]")
+        else:
+            chosen = run_model_picker()
+            if chosen:
+                cfg["model"] = chosen
+                print(f"  [model → {cfg['model']}]")
+            else:
+                print("  [cancelled — model unchanged]")
         return True, adapter
 
     elif cmd == "/project":

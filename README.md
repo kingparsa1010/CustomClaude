@@ -125,15 +125,41 @@ python claude_cli.py --project ~/code/my-app
 |----------------------|------------------------------------------------------|
 | `/help`             | Show the command list                                  |
 | `/clear`            | Wipe conversation history                               |
-| `/model <id>`       | Switch model                                            |
+| `/model`            | Open the interactive model picker (free models first, then paid/all — fetched live from the provider) |
+| `/model <id>`       | Switch directly to a model ID                           |
 | `/effort <level>`   | Change reasoning effort                                 |
-| `/apitype <type>`   | Switch API type (`auto`/`openai`/`anthropic`/`gemini`) — clears history |
+| `/apitype <type>`   | Switch API type (`auto`/`openai`/`anthropic`/`gemini`) — resets endpoint + model to that type's defaults and clears history |
 | `/endpoint <url>`   | Change the base URL                                     |
 | `/key <key>`        | Change the API key                                      |
 | `/project <path>`   | Change working directory                                |
 | `/exit`             | Quit                                                    |
 
+### Model picker
+
+Run `/model` with no argument to get a Claude-Code-style picker instead of typing a model ID by hand:
+
+```
+────────────────────────────────────────────────────────────
+  Select a model  (gemini · https://generativelanguage.googleapis.com)
+────────────────────────────────────────────────────────────
+  Free
+    1) gemini-2.5-flash  (current)
+    2) gemini-2.5-pro
+    3) gemini-2.5-flash-lite
+    0) Cancel
+────────────────────────────────────────────────────────────
+```
+
+It fetches the live model list straight from the provider you're currently connected to:
+- **OpenRouter** (`openai` type) — splits into **Free** and **Paid** using each model's actual pricing data (the `:free` suffix and zero-cost pricing fields)
+- **Gemini** — every model your key can reach is shown under **Free**, since AI Studio keys use a free per-minute/day quota rather than a separate paid tier
+- **Anthropic** — flat list of everything your key has access to (no free tier to split on)
+
+If the live fetch fails (bad key, offline, endpoint doesn't expose a models route) it falls back to a small static list and says so. You can also type an exact model ID instead of a number if you want something not in the list.
+
 ### Multi-line input
+
+
 
 Type `"""` on its own line to open a block, write as many lines as you want, then type `"""` again to submit.
 
